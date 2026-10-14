@@ -95,6 +95,7 @@ The following patches may be useful to support the Incus TrueNAS driver.
 - [back-port zfs.snapshot.rename functionality](#zfssnapshotrename-backport)
 - [increase max_calls](#increase-max-api-calls)
 - [iSCSI defer functionality](#iscsi-defer-functionality)
+- [session leak fix](#session-leak-fix)
 
 The middlewared source on a TrueNAS installation is located at `/usr/lib/python3/dist-packages/middlewared`
 
@@ -174,6 +175,28 @@ The iscsi target deletion improvement improves iscsi deletion operations by abou
 improvement.
 
 When performance/integration testing the Incus driver, you may want to apply this patch if it is not already applied, as it can significantly reduce the runtime of integration tests.
+
+### Session leak fix
+
+On TrueNAS 25.10 the middleware can keep API sessions in `auth.sessions` although their WebSocket connection is long gone. They pile up (visible under System → Advanced → Access, which eventually stops loading) and `auth.terminate_session` can not remove them. Two causes in `plugins/auth.py`:
+
+1. **Disconnect during login:** `SessionManager.login` registers its CLOSE callback only after the (PAM) login finished. If the client disconnects while the login is still running, the CLOSE callbacks have already run, so the session is never removed.
+2. **Failing logout:** `SessionManager.logout` writes the audit log entry before removing the session. If that raises, the session stays.
+
+Additionally `auth.terminate_session` only closes the WebSocket; for an already closed connection that is a no-op, so orphaned sessions survive.
+
+[`patches/middlewared-25.10-session-leak.patch`](patches/middlewared-25.10-session-leak.patch) fixes all three: login detects a disconnect that happened during login, logout removes the session first and tolerates audit/PAM errors, and `terminate_session` always logs the session out.
+
+disable the [/usr readonly protection](#removing-usr-read-only-protection), then apply the patch and [restart the middleware](#restarting-middlewared) (which also clears all orphaned sessions)
+
+```sh
+cd /usr/lib/python3/dist-packages
+patch -p3 --dry-run < /root/middlewared-25.10-session-leak.patch && patch -p3 < /root/middlewared-25.10-session-leak.patch
+```
+
+To revert, run the same command with `-R`. The patch was made against the `TS-25.10.0` tag; on other versions check the `--dry-run` output first.
+
+[`scripts/tn_stale_sessions.py`](scripts/tn_stale_sessions.py) lists sessions without a TCP connection (dry run by default, `--help` for filters) and terminates them with `--apply`; with the patch applied this also removes orphaned sessions.
 
 ### Restarting Middlewared
 
