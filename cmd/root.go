@@ -48,6 +48,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&g_apiKey, "api-key", "K", "", "API key")
 
 	daemonCmd.Flags().StringP("timeout", "t", "", "Exit the daemon if no communication occurs after this duration")
+	daemonCmd.Flags().StringP("session-idle-timeout", "i", "", "Log out and close TrueNAS connections that were idle for this duration (default 2m, 0 disables)")
 
 	rootCmd.AddCommand(daemonCmd)
 }
@@ -68,11 +69,15 @@ func runDaemon(cmd *cobra.Command, args []string) {
 	if f != nil {
 		globalTimeoutStr = f.Value.String()
 	}
+	var sessionIdleTimeoutStr string
+	if f := cmd.Flags().Lookup("session-idle-timeout"); f != nil {
+		sessionIdleTimeoutStr = f.Value.String()
+	}
 	serverSockAddr := args[0]
 	if serverSockAddr == "" {
 		log.Fatal("Error: path to server socket was not provided")
 	}
-	core.RunDaemon(serverSockAddr, globalTimeoutStr)
+	core.RunDaemon(serverSockAddr, globalTimeoutStr, sessionIdleTimeoutStr)
 }
 
 func InitializeApiClient() core.Session {

@@ -23,25 +23,46 @@ import (
 const TNC_PREFIX_STRING = "tnc_daemon."
 const JOB_WAIT_STRING = "core.job_wait"
 const DEFAULT_CALL_TIMEOUT = "30s" // also see: cmd.defaultCallTimeout
+const DEFAULT_SESSION_IDLE_TIMEOUT = 2 * time.Minute
+const MAX_CALL_ATTEMPTS = 3
+
+// WebSocket keepalive. The read deadline is only enforced once the server has answered a ping,
+// so a server that doesn't reply to pings never gets its connections dropped.
+var sessionPingInterval = 30 * time.Second
+var sessionReadTimeout = 90 * time.Second
+var sessionReaperInterval = 15 * time.Second
+
+const sessionLogoutTimeout = "5s"
+const sessionCloseGracePeriod = time.Second
 
 type TruenasSession struct {
-	url             string
-	conn            *websocket.Conn
-	ctx             *DaemonContext
-	sessionKey      string
-	channel         int
-	connMtx         *sync.Mutex
-	callInProgress_ bool
-	curCallId_      int64
-	callMap_        map[int64]*Future[json.RawMessage]
-	jobMap_         map[int64]*Future[json.RawMessage]
+	url          string
+	conn         *websocket.Conn
+	ctx          *DaemonContext
+	sessionKey   string
+	channel      int
+	future       *Future[*TruenasSession]
+	connMtx      *sync.Mutex
+	writeMtx     *sync.Mutex
+	doneCh       chan struct{}
+	pingInterval time.Duration
+	readTimeout  time.Duration
+	inFlight_    int
+	lastUsed_    time.Time
+	closing_     bool
+	curCallId_   int64
+	callMap_     map[int64]*Future[json.RawMessage]
+	jobMap_      map[int64]*Future[json.RawMessage]
 }
 
 type DaemonContext struct {
-	timeoutValue time.Duration
-	timeoutTimer *time.Timer
-	mapMtx       *sync.Mutex
-	sessionMap_  map[string][]*Future[*TruenasSession]
+	timeoutValue       time.Duration
+	timeoutTimer       *time.Timer
+	sessionIdleTimeout time.Duration
+	timerMtx           *sync.Mutex
+	activeRequests_    int
+	mapMtx             *sync.Mutex
+	sessionMap_        map[string][]*Future[*TruenasSession]
 }
 
 type CallInfo struct {
@@ -55,7 +76,22 @@ type LoginInfo struct {
 	allowInsecure bool
 }
 
-func RunDaemon(serverSockAddr string, globalTimeoutStr string) {
+func newDaemonContext(daemonTimeout time.Duration, sessionIdleTimeout time.Duration) *DaemonContext {
+	var timer *time.Timer
+	if daemonTimeout != 0 {
+		timer = time.NewTimer(daemonTimeout)
+	}
+	return &DaemonContext{
+		timeoutValue:       daemonTimeout,
+		timeoutTimer:       timer,
+		sessionIdleTimeout: sessionIdleTimeout,
+		timerMtx:           &sync.Mutex{},
+		mapMtx:             &sync.Mutex{},
+		sessionMap_:        make(map[string][]*Future[*TruenasSession]),
+	}
+}
+
+func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeoutStr string) {
 	var err error
 	var daemonTimeout time.Duration
 	if globalTimeoutStr != "" {
@@ -64,10 +100,20 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string) {
 			log.Fatal("Error: could not parse duration \"" + globalTimeoutStr + "\":" + err.Error())
 		}
 	}
+	sessionIdleTimeout := DEFAULT_SESSION_IDLE_TIMEOUT
+	if sessionIdleTimeoutStr != "" {
+		sessionIdleTimeout, err = time.ParseDuration(sessionIdleTimeoutStr)
+		if err != nil {
+			log.Fatal("Error: could not parse duration \"" + sessionIdleTimeoutStr + "\":" + err.Error())
+		}
+	}
 
 	fmt.Println("Serving on", serverSockAddr)
 	if daemonTimeout != 0 {
 		fmt.Println("With a daemon timeout of", daemonTimeout.String())
+	}
+	if sessionIdleTimeout > 0 {
+		fmt.Println("Closing TrueNAS sessions after being idle for", sessionIdleTimeout.String())
 	}
 
 	ls, err := net.Listen("unix", serverSockAddr)
@@ -76,19 +122,18 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string) {
 		return
 	}
 
-	var timer *time.Timer
-	if daemonTimeout != 0 {
-		timer = time.NewTimer(daemonTimeout)
+	daemon := newDaemonContext(daemonTimeout, sessionIdleTimeout)
+
+	if sessionIdleTimeout > 0 {
+		go func() {
+			ticker := time.NewTicker(sessionReaperInterval)
+			for range ticker.C {
+				daemon.reapIdleSessions()
+			}
+		}()
 	}
 
-	daemon := &DaemonContext{
-		timeoutValue: daemonTimeout,
-		timeoutTimer: timer,
-		mapMtx:       &sync.Mutex{},
-		sessionMap_:  make(map[string][]*Future[*TruenasSession]),
-	}
-
-	doneCh := make(chan os.Signal)
+	doneCh := make(chan os.Signal, 1)
 	signal.Notify(doneCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		if daemon.timeoutTimer != nil {
@@ -104,20 +149,7 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string) {
 			<-doneCh
 		}
 		_ = ls.Close()
-		sessions := make([]*Future[*TruenasSession], 0)
-		daemon.mapMtx.Lock()
-		for _, futures := range daemon.sessionMap_ {
-			sessions = append(sessions, futures...)
-		}
-		daemon.mapMtx.Unlock()
-		for _, future := range sessions {
-			if future != nil {
-				_, s, _ := future.Peek()
-				if s != nil {
-					s.conn.Close()
-				}
-			}
-		}
+		daemon.closeAllSessions()
 		os.Remove(serverSockAddr)
 		os.Exit(0)
 	}()
@@ -127,13 +159,31 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string) {
 	doneCh <- syscall.SIGTERM
 }
 
-func (d *DaemonContext) UpdateCountdown() {
+// The daemon timeout only counts time without any client requests in flight.
+// Messages from TrueNAS (e.g. job events) do not keep the daemon alive.
+func (d *DaemonContext) requestStarted() {
+	d.timerMtx.Lock()
+	defer d.timerMtx.Unlock()
+	d.activeRequests_++
 	if d.timeoutTimer != nil {
+		d.timeoutTimer.Stop()
+	}
+}
+
+func (d *DaemonContext) requestFinished() {
+	d.timerMtx.Lock()
+	defer d.timerMtx.Unlock()
+	d.activeRequests_--
+	if d.activeRequests_ <= 0 && d.timeoutTimer != nil {
+		d.activeRequests_ = 0
 		d.timeoutTimer.Reset(d.timeoutValue)
 	}
 }
 
 func (d *DaemonContext) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	d.requestStarted()
+	defer d.requestFinished()
+
 	out, err := d.serveImpl(r)
 	if err != nil {
 		//log.Println(err)
@@ -213,101 +263,85 @@ func (d *DaemonContext) serveImpl(r *http.Request) (json.RawMessage, error) {
 		allowInsecure: allowInsecure,
 	}
 
-retry:
-	out, err, shouldRetry := d.maybeCreateSessionAndCall(sessionKey, timeoutStr, call, login)
-	if shouldRetry {
-		goto retry
+	var out json.RawMessage
+	for attempt := 1; attempt <= MAX_CALL_ATTEMPTS; attempt++ {
+		var shouldRetry bool
+		out, err, shouldRetry = d.maybeCreateSessionAndCall(sessionKey, timeoutStr, call, login)
+		if !shouldRetry {
+			break
+		}
+		log.Println("Daemon: retrying", method, "on a fresh connection (attempt", attempt+1, "of", MAX_CALL_ATTEMPTS, ")")
 	}
 	return out, err
 }
 
 func (d *DaemonContext) maybeCreateSessionAndCall(sessionKey string, timeoutStr string, call CallInfo, login LoginInfo) (json.RawMessage, error, bool) {
-	shouldCreate := false
-	channel := -1
-	var future *Future[*TruenasSession]
-
-	d.mapMtx.Lock()
-	futureSessions, exists := d.sessionMap_[sessionKey]
-	if !exists {
-		channel = 0
-		future = MakeFuture[*TruenasSession]()
-		futureSessions = []*Future[*TruenasSession]{future}
-		d.sessionMap_[sessionKey] = futureSessions
-		shouldCreate = true
-	} else {
-		for i := 0; i < len(futureSessions); i++ {
-			if futureSessions[i] == nil {
-				channel = i
-				future = MakeFuture[*TruenasSession]()
-				futureSessions[i] = future
-				d.sessionMap_[sessionKey] = futureSessions
-				shouldCreate = true
-				break
-			}
-			done, session, err := futureSessions[i].Peek()
-			if !done || err != nil {
-				continue
-			}
-			session.connMtx.Lock()
-			if !session.callInProgress_ {
-				channel = i
-				future = futureSessions[i]
-			}
-			session.connMtx.Unlock()
-			if future != nil {
-				break
-			}
-		}
-		if channel < 0 {
-			channel = len(futureSessions)
-			future = MakeFuture[*TruenasSession]()
-			futureSessions = append(futureSessions, future)
-			d.sessionMap_[sessionKey] = futureSessions
-			shouldCreate = true
-		}
-	}
-	d.mapMtx.Unlock()
-
-	var s *TruenasSession
-	var err error
-
-	if shouldCreate {
-		s, err = d.createSession(sessionKey, login, channel)
-		if err != nil {
-			future.Fail(err)
-		} else if s == nil {
-			err = fmt.Errorf("Failed to launch TrueNAS client session (unknown error)")
-			future.Fail(err)
-		} else {
-			future.Complete(s)
-		}
-	} else {
-		s, err = future.Get()
-	}
-
-	//log.Println("Done waiting for session")
-
-	if s == nil {
-		if err == nil {
-			err = fmt.Errorf("serveImpl: session doesn't exist after waiting for its creation without (unknown error)")
-		}
-	}
+	s, err := d.acquireSession(sessionKey, login)
 	if err != nil {
-		d.deleteSession(sessionKey, channel)
 		return nil, err, false
 	}
 
 	//log.Println("Calling method", method)
 
 	out, err, shouldRetry := s.callJson(call.method, timeoutStr, call.params)
+	s.release()
+
+	if !shouldRetry && err == nil && IsNotAuthenticatedResponse(out) {
+		log.Println("Daemon: TrueNAS session is no longer authenticated, reconnecting")
+		shouldRetry = true
+	}
 	if shouldRetry {
-		d.deleteSession(sessionKey, channel)
+		d.discardSession(s, false)
 	}
 
 	return out, err, shouldRetry
 }
 
-func (d *DaemonContext) createSession(sessionKey string, login LoginInfo, channel int) (*TruenasSession, error) {
+// acquireSession reserves an idle connection for sessionKey, or creates a new one.
+// The returned session must be handed back with release().
+func (d *DaemonContext) acquireSession(sessionKey string, login LoginInfo) (*TruenasSession, error) {
+	d.mapMtx.Lock()
+	futureSessions := d.sessionMap_[sessionKey]
+	channel := -1
+	for i := 0; i < len(futureSessions); i++ {
+		if futureSessions[i] == nil {
+			if channel < 0 {
+				channel = i
+			}
+			continue
+		}
+		done, session, err := futureSessions[i].Peek()
+		if !done || err != nil || session == nil {
+			continue
+		}
+		if session.tryReserve() {
+			d.mapMtx.Unlock()
+			return session, nil
+		}
+	}
+	if channel < 0 {
+		channel = len(futureSessions)
+		futureSessions = append(futureSessions, nil)
+	}
+	future := MakeFuture[*TruenasSession]()
+	futureSessions[channel] = future
+	d.sessionMap_[sessionKey] = futureSessions
+	d.mapMtx.Unlock()
+
+	s, err := d.createSession(sessionKey, login, channel, future)
+	if err == nil && s == nil {
+		err = fmt.Errorf("Failed to launch TrueNAS client session (unknown error)")
+	}
+	if err != nil {
+		future.Fail(err)
+		d.removeSession(sessionKey, channel, future)
+		return nil, err
+	}
+	future.Complete(s)
+	return s, nil
+}
+
+func (d *DaemonContext) createSession(sessionKey string, login LoginInfo, channel int, future *Future[*TruenasSession]) (*TruenasSession, error) {
 	u, err := url.Parse(login.serverUrl)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid URL: %w", err)
@@ -330,46 +364,242 @@ func (d *DaemonContext) createSession(sessionKey string, login LoginInfo, channe
 	}
 
 	session := &TruenasSession{
-		url:        login.serverUrl,
-		conn:       conn,
-		ctx:        d,
-		sessionKey: sessionKey,
-		channel:    channel,
-		connMtx:    &sync.Mutex{},
-		curCallId_: 0,
-		callMap_:   make(map[int64]*Future[json.RawMessage]),
-		jobMap_:    make(map[int64]*Future[json.RawMessage]),
+		url:          login.serverUrl,
+		conn:         conn,
+		ctx:          d,
+		sessionKey:   sessionKey,
+		channel:      channel,
+		future:       future,
+		connMtx:      &sync.Mutex{},
+		writeMtx:     &sync.Mutex{},
+		doneCh:       make(chan struct{}),
+		pingInterval: sessionPingInterval,
+		readTimeout:  sessionReadTimeout,
+		inFlight_:    1, // reserved for the request that created it
+		lastUsed_:    time.Now(),
+		curCallId_:   0,
+		callMap_:     make(map[int64]*Future[json.RawMessage]),
+		jobMap_:      make(map[int64]*Future[json.RawMessage]),
 	}
 
 	go session.listen()
+	go session.keepAlive()
 
-	_, err, _ = session.callJson(login.call.method, DEFAULT_CALL_TIMEOUT, login.call.params)
+	out, err, _ := session.callJson(login.call.method, DEFAULT_CALL_TIMEOUT, login.call.params)
+	if err == nil {
+		err = checkLoginResponse(out)
+	}
 	if err != nil {
+		session.shutdown(false)
 		return nil, err
 	}
 
 	_, err, _ = session.callJson("core.subscribe", DEFAULT_CALL_TIMEOUT, []interface{}{"core.get_jobs"})
 	if err != nil {
+		session.shutdown(true)
 		return nil, err
 	}
 
 	return session, nil
 }
 
-func (d *DaemonContext) deleteSession(sessionKey string, channel int) {
+func checkLoginResponse(out json.RawMessage) error {
+	var response map[string]interface{}
+	if err := json.Unmarshal(out, &response); err != nil {
+		return fmt.Errorf("Login failed: could not parse response: %w", err)
+	}
+	if errValue, exists := response["error"]; exists && errValue != nil {
+		return fmt.Errorf("Login failed: %s", ExtractApiErrorJsonGivenError(errValue))
+	}
+	if ok, _ := response["result"].(bool); !ok {
+		return fmt.Errorf("Login failed: TrueNAS rejected the credentials")
+	}
+	return nil
+}
+
+// IsNotAuthenticatedResponse reports whether TrueNAS rejected a call because the
+// connection is no longer logged in (e.g. after the middleware expired the session).
+func IsNotAuthenticatedResponse(out json.RawMessage) bool {
+	if len(out) == 0 {
+		return false
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(out, &response); err != nil {
+		return false
+	}
+	errMap, ok := response["error"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	texts := []interface{}{errMap["message"]}
+	if data, ok := errMap["data"].(map[string]interface{}); ok {
+		if errname, _ := data["errname"].(string); errname == "ENOTAUTHENTICATED" {
+			return true
+		}
+		texts = append(texts, data["reason"])
+	}
+	for _, t := range texts {
+		if str, ok := t.(string); ok && strings.Contains(strings.ToLower(str), "not authenticated") {
+			return true
+		}
+	}
+	return false
+}
+
+// removeSession frees the slot, but only if it still belongs to the given session future
+func (d *DaemonContext) removeSession(sessionKey string, channel int, future *Future[*TruenasSession]) {
 	d.mapMtx.Lock()
-	if sessionList, exists := d.sessionMap_[sessionKey]; exists {
-		if channel >= 0 && channel < len(sessionList) {
-			sessionList[channel] = nil
-			d.sessionMap_[sessionKey] = sessionList
+	defer d.mapMtx.Unlock()
+	sessionList, exists := d.sessionMap_[sessionKey]
+	if !exists || channel < 0 || channel >= len(sessionList) || sessionList[channel] != future {
+		return
+	}
+	sessionList[channel] = nil
+	for _, f := range sessionList {
+		if f != nil {
+			return
+		}
+	}
+	delete(d.sessionMap_, sessionKey)
+}
+
+func (d *DaemonContext) discardSession(s *TruenasSession, logout bool) {
+	s.markClosing()
+	d.removeSession(s.sessionKey, s.channel, s.future)
+	s.shutdown(logout)
+}
+
+func (d *DaemonContext) reapIdleSessions() {
+	if d.sessionIdleTimeout <= 0 {
+		return
+	}
+	now := time.Now()
+	idle := make([]*TruenasSession, 0)
+
+	d.mapMtx.Lock()
+	for _, futureSessions := range d.sessionMap_ {
+		for _, f := range futureSessions {
+			if f == nil {
+				continue
+			}
+			done, s, err := f.Peek()
+			if done && err == nil && s != nil && s.tryMarkIdleClosing(now, d.sessionIdleTimeout) {
+				idle = append(idle, s)
+			}
 		}
 	}
 	d.mapMtx.Unlock()
+
+	for _, s := range idle {
+		log.Println("Daemon: closing TrueNAS session idle for more than", d.sessionIdleTimeout.String())
+		d.removeSession(s.sessionKey, s.channel, s.future)
+		go s.shutdown(true)
+	}
+}
+
+func (d *DaemonContext) closeAllSessions() {
+	sessions := make([]*TruenasSession, 0)
+	d.mapMtx.Lock()
+	for _, futureSessions := range d.sessionMap_ {
+		for _, f := range futureSessions {
+			if f == nil {
+				continue
+			}
+			if _, s, _ := f.Peek(); s != nil {
+				sessions = append(sessions, s)
+			}
+		}
+	}
+	d.sessionMap_ = make(map[string][]*Future[*TruenasSession])
+	d.mapMtx.Unlock()
+
+	var wg sync.WaitGroup
+	for _, s := range sessions {
+		wg.Add(1)
+		go func(s *TruenasSession) {
+			defer wg.Done()
+			s.shutdown(true)
+		}(s)
+	}
+	wg.Wait()
+}
+
+func (s *TruenasSession) tryReserve() bool {
+	s.connMtx.Lock()
+	defer s.connMtx.Unlock()
+	if s.closing_ || s.inFlight_ > 0 {
+		return false
+	}
+	s.inFlight_++
+	s.lastUsed_ = time.Now()
+	return true
+}
+
+func (s *TruenasSession) release() {
+	s.connMtx.Lock()
+	defer s.connMtx.Unlock()
+	if s.inFlight_ > 0 {
+		s.inFlight_--
+	}
+	s.lastUsed_ = time.Now()
+}
+
+func (s *TruenasSession) markClosing() {
+	s.connMtx.Lock()
+	s.closing_ = true
+	s.connMtx.Unlock()
+}
+
+func (s *TruenasSession) tryMarkIdleClosing(now time.Time, idleTimeout time.Duration) bool {
+	s.connMtx.Lock()
+	defer s.connMtx.Unlock()
+	if s.closing_ || s.inFlight_ > 0 || now.Sub(s.lastUsed_) < idleTimeout {
+		return false
+	}
+	s.closing_ = true
+	return true
+}
+
+// shutdown disconnects cleanly: optional auth.logout, then a WebSocket close handshake,
+// so the TrueNAS middleware can drop the session instead of keeping it around.
+func (s *TruenasSession) shutdown(logout bool) {
+	s.markClosing()
+	if logout {
+		if out, err, _ := s.callJson("auth.logout", sessionLogoutTimeout, []interface{}{}); err != nil {
+			log.Println("Daemon: auth.logout failed:", err)
+		} else if errMsg := ExtractApiError(out); errMsg != "" && !IsNotAuthenticatedResponse(out) {
+			log.Println("Daemon: auth.logout failed:", errMsg)
+		}
+	}
+	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	if err := s.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(sessionCloseGracePeriod)); err == nil {
+		// give the server a moment to answer the close handshake before dropping the socket
+		select {
+		case <-s.doneCh:
+		case <-time.After(sessionCloseGracePeriod):
+		}
+	}
+	_ = s.conn.Close()
+}
+
+func (s *TruenasSession) keepAlive() {
+	ticker := time.NewTicker(s.pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.doneCh:
+			return
+		case <-ticker.C:
+			if err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pingInterval)); err != nil {
+				log.Println("Daemon: websocket ping failed:", err)
+				_ = s.conn.Close()
+				return
+			}
+		}
+	}
 }
 
 func (s *TruenasSession) callJson(method string, timeoutStr string, request []interface{}) (json.RawMessage, error, bool) {
-	s.ctx.UpdateCountdown()
-
 	if strings.HasPrefix(method, TNC_PREFIX_STRING) {
 		out, err := s.handleDaemonProcedure(method[len(TNC_PREFIX_STRING):], timeoutStr, request)
 		return out, err, false
@@ -380,8 +610,13 @@ func (s *TruenasSession) callJson(method string, timeoutStr string, request []in
 	callId := s.curCallId_
 	fCall := MakeFuture[json.RawMessage]()
 	s.callMap_[callId] = fCall
-	s.callInProgress_ = true
 	s.connMtx.Unlock()
+
+	defer func() {
+		s.connMtx.Lock()
+		delete(s.callMap_, callId)
+		s.connMtx.Unlock()
+	}()
 
 	reqMsg := make(map[string]interface{})
 	reqMsg["jsonrpc"] = "2.0"
@@ -391,9 +626,13 @@ func (s *TruenasSession) callJson(method string, timeoutStr string, request []in
 
 	//log.Println("Writing JSON request with callId:", callId, reqMsg)
 
-	if err := wrapWriteJSON(s.conn, reqMsg); err != nil {
+	s.writeMtx.Lock()
+	err := wrapWriteJSON(s.conn, reqMsg)
+	s.writeMtx.Unlock()
+	if err != nil {
 		errMsg := err.Error()
-		shouldRetry := strings.Contains(errMsg, "use of closed network connection") || strings.Contains(errMsg, "gorilla panic")
+		shouldRetry := strings.Contains(errMsg, "use of closed network connection") || strings.Contains(errMsg, "gorilla panic") ||
+			strings.Contains(errMsg, "broken pipe") || strings.Contains(errMsg, "connection reset") || errors.Is(err, websocket.ErrCloseSent)
 		return nil, err, shouldRetry
 	}
 
@@ -407,11 +646,6 @@ func (s *TruenasSession) callJson(method string, timeoutStr string, request []in
 		timeoutParsed := timeout.String()
 		return nil, fmt.Errorf("Request timed out (exceeded %s)", timeoutParsed), false
 	}
-
-	s.connMtx.Lock()
-	delete(s.callMap_, callId)
-	s.callInProgress_ = false
-	s.connMtx.Unlock()
 
 	if err != nil {
 		return nil, err, false
@@ -442,13 +676,20 @@ func wrapWriteJSON(conn *websocket.Conn, reqMsg interface{}) (err error) {
 
 func (s *TruenasSession) listen() {
 	var err error
+	pongSeen := false
+	s.conn.SetPongHandler(func(string) error {
+		pongSeen = true
+		return s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	})
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println("Recovered from panic:", r)
 		}
 		internalErr := fmt.Errorf("listen() exiting: %v", err)
+		close(s.doneCh)
 		_ = s.conn.Close()
 		s.connMtx.Lock()
+		s.closing_ = true
 		for _, f := range s.callMap_ {
 			f.Fail(internalErr)
 		}
@@ -456,7 +697,7 @@ func (s *TruenasSession) listen() {
 			f.Fail(internalErr)
 		}
 		s.connMtx.Unlock()
-		s.ctx.deleteSession(s.sessionKey, s.channel)
+		s.ctx.removeSession(s.sessionKey, s.channel, s.future)
 		log.Println("listen exiting")
 	}()
 	for true {
@@ -465,6 +706,9 @@ func (s *TruenasSession) listen() {
 		if err != nil {
 			log.Println("listen s.conn.ReadMessage:", err)
 			return
+		}
+		if pongSeen {
+			_ = s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 		}
 
 		var response interface{}
@@ -475,8 +719,6 @@ func (s *TruenasSession) listen() {
 		if !ok {
 			continue
 		}
-
-		s.ctx.UpdateCountdown()
 
 		innerJobId := int64(-1)
 
@@ -581,9 +823,13 @@ func (s *TruenasSession) handleDaemonProcedure(proc string, timeoutStr string, p
 			}
 		}
 
-		_, err, _ := s.callJson(JOB_WAIT_STRING, timeoutStr, []interface{}{firstParamAsNumber})
+		out, err, _ := s.callJson(JOB_WAIT_STRING, timeoutStr, []interface{}{firstParamAsNumber})
 		if err != nil {
 			return nil, err
+		}
+		if IsNotAuthenticatedResponse(out) {
+			// the job event would never arrive; let the caller reconnect and retry
+			return out, nil
 		}
 
 		return fJob.Get()
