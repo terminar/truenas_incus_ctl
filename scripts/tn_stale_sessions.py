@@ -96,15 +96,19 @@ check_tcp = not (args.ignore_tcp or args.all)
 now = time.time()
 
 matched = []
+skipped = Counter()
 for s in sessions:
     origin = str(s.get("origin") or "")
     if s.get("current"):
+        skipped["eigene"] += 1
         continue  # eigene Session nie anfassen
     is_tcp = bool(re.search(r":\d+$", origin))
     if not is_tcp and not args.include_unix:
+        skipped["Unix-Socket (--include-unix)"] += 1
         continue  # Unix-Socket-Sessions nur mit --include-unix
     ts = created_ts(s)
     if ts is None or now - ts < args.min_age:
+        skipped[f"jünger als {args.min_age}s (--min-age)"] += 1
         continue
     if args.older_than is not None and ts >= args.older_than:
         continue
@@ -128,6 +132,8 @@ if args.json:
 
 what = "passend" if not check_tcp else "tot (ohne TCP-Verbindung)"
 print(f"{len(sessions)} externe Sessions, {len(peers)} TCP-Verbindungen, {len(matched)} {what}", file=sys.stderr)
+if skipped:
+    print("ausgeblendet: " + ", ".join(f"{n} {why}" for why, n in skipped.items()), file=sys.stderr)
 
 if args.count:
     counts = Counter(re.sub(r":\d+$", "", norm(str(s.get("origin") or "?"))) for s in matched)
