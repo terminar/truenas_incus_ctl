@@ -18,6 +18,16 @@ type Session interface {
 	Close(error) error
 }
 
+// Sessions that can handle calls from several goroutines at once implement this
+type ConcurrentSession interface {
+	SupportsConcurrentCalls() bool
+}
+
+func SupportsConcurrentCalls(s Session) bool {
+	c, ok := s.(ConcurrentSession)
+	return ok && c.SupportsConcurrentCalls()
+}
+
 func MaybeLogin(s Session) error {
 	if s.IsLoggedIn() {
 		return nil

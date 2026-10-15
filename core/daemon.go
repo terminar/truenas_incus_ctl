@@ -32,6 +32,20 @@ var sessionPingInterval = 30 * time.Second
 var sessionReadTimeout = 90 * time.Second
 var sessionReaperInterval = 15 * time.Second
 
+// Every connection costs the middleware a login (PAM, audit, utmp entry). Parallel requests
+// are multiplexed over a few connections per host, and only one login per host runs at a time,
+// so a burst of requests (e.g. the Incus UI querying many volumes) can't flood TrueNAS with logins.
+// Measured on a TrueNAS 25.10 with ~2400 snapshots: a login takes ~0.25s on the middleware's
+// event loop and zfs.snapshot.query ~1s, with a total throughput of ~2.6/s no matter how many
+// calls run in parallel. 2 x 4 calls per daemon keeps 7 daemons below the 30s call timeout.
+const DEFAULT_MAX_SESSIONS_PER_HOST = 2
+const DEFAULT_MAX_CALLS_PER_SESSION = 4
+
+var maxSessionsPerHost = DEFAULT_MAX_SESSIONS_PER_HOST
+var maxCallsPerSession = DEFAULT_MAX_CALLS_PER_SESSION
+var sessionAcquireTimeout = 90 * time.Second
+var sessionHandshakeTimeout = 30 * time.Second
+
 const sessionLogoutTimeout = "5s"
 const sessionCloseGracePeriod = time.Second
 
@@ -47,9 +61,12 @@ type TruenasSession struct {
 	doneCh       chan struct{}
 	pingInterval time.Duration
 	readTimeout  time.Duration
+	shutdownOnce sync.Once
 	inFlight_    int
 	lastUsed_    time.Time
 	closing_     bool
+	drain_       bool // shut down once the calls in flight are done
+	drainLogout_ bool
 	curCallId_   int64
 	callMap_     map[int64]*Future[json.RawMessage]
 	jobMap_      map[int64]*Future[json.RawMessage]
@@ -63,6 +80,8 @@ type DaemonContext struct {
 	activeRequests_    int
 	mapMtx             *sync.Mutex
 	sessionMap_        map[string][]*Future[*TruenasSession]
+	sessionsChanged_   chan struct{}  // closed and replaced whenever a session frees up or goes away
+	snapshotCache      *snapshotCache // nil if disabled
 }
 
 type CallInfo struct {
@@ -76,10 +95,14 @@ type LoginInfo struct {
 	allowInsecure bool
 }
 
-func newDaemonContext(daemonTimeout time.Duration, sessionIdleTimeout time.Duration) *DaemonContext {
+func newDaemonContext(daemonTimeout time.Duration, sessionIdleTimeout time.Duration, snapshotCacheTtl time.Duration) *DaemonContext {
 	var timer *time.Timer
 	if daemonTimeout != 0 {
 		timer = time.NewTimer(daemonTimeout)
+	}
+	var cache *snapshotCache
+	if snapshotCacheTtl >= 0 {
+		cache = newSnapshotCache(snapshotCacheTtl)
 	}
 	return &DaemonContext{
 		timeoutValue:       daemonTimeout,
@@ -88,10 +111,12 @@ func newDaemonContext(daemonTimeout time.Duration, sessionIdleTimeout time.Durat
 		timerMtx:           &sync.Mutex{},
 		mapMtx:             &sync.Mutex{},
 		sessionMap_:        make(map[string][]*Future[*TruenasSession]),
+		sessionsChanged_:   make(chan struct{}),
+		snapshotCache:      cache,
 	}
 }
 
-func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeoutStr string) {
+func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeoutStr string, maxConnections int, maxCalls int, snapshotCacheTtlStr string) {
 	var err error
 	var daemonTimeout time.Duration
 	if globalTimeoutStr != "" {
@@ -108,7 +133,25 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeou
 		}
 	}
 
+	snapshotCacheTtl := DEFAULT_SNAPSHOT_CACHE_TTL
+	if snapshotCacheTtlStr != "" {
+		snapshotCacheTtl, err = time.ParseDuration(snapshotCacheTtlStr)
+		if err != nil {
+			log.Fatal("Error: could not parse duration \"" + snapshotCacheTtlStr + "\":" + err.Error())
+		}
+	}
+	if maxConnections > 0 {
+		maxSessionsPerHost = maxConnections
+	}
+	if maxCalls > 0 {
+		maxCallsPerSession = maxCalls
+	}
+
 	fmt.Println("Serving on", serverSockAddr)
+	fmt.Println("Using at most", maxSessionsPerHost, "connections per TrueNAS host with", maxCallsPerSession, "calls each")
+	if snapshotCacheTtl >= 0 {
+		fmt.Println("Sharing snapshot queries, caching them for", snapshotCacheTtl.String())
+	}
 	if daemonTimeout != 0 {
 		fmt.Println("With a daemon timeout of", daemonTimeout.String())
 	}
@@ -122,7 +165,7 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeou
 		return
 	}
 
-	daemon := newDaemonContext(daemonTimeout, sessionIdleTimeout)
+	daemon := newDaemonContext(daemonTimeout, sessionIdleTimeout, snapshotCacheTtl)
 
 	if sessionIdleTimeout > 0 {
 		go func() {
@@ -263,14 +306,37 @@ func (d *DaemonContext) serveImpl(r *http.Request) (json.RawMessage, error) {
 		allowInsecure: allowInsecure,
 	}
 
+	if d.snapshotCache != nil {
+		if filters, cacheKey, ok := snapshotQueryCacheKey(method, params); ok {
+			all, err := d.snapshotCache.get(sessionKey+"\n"+cacheKey, func() (json.RawMessage, error) {
+				fetchAll := CallInfo{method: method, params: []interface{}{[]interface{}{}, params[1]}}
+				return d.callWithRetries(sessionKey, timeoutStr, fetchAll, login)
+			})
+			if err != nil {
+				return nil, err
+			}
+			return makeResultResponse(filterSnapshots(all, filters))
+		}
+		if !isReadOnlyMethod(method) {
+			// before and after: jobs started by the call may finish later (see tnc_daemon.await_job)
+			d.snapshotCache.invalidate()
+			defer d.snapshotCache.invalidate()
+		}
+	}
+
+	return d.callWithRetries(sessionKey, timeoutStr, call, login)
+}
+
+func (d *DaemonContext) callWithRetries(sessionKey string, timeoutStr string, call CallInfo, login LoginInfo) (json.RawMessage, error) {
 	var out json.RawMessage
+	var err error
 	for attempt := 1; attempt <= MAX_CALL_ATTEMPTS; attempt++ {
 		var shouldRetry bool
 		out, err, shouldRetry = d.maybeCreateSessionAndCall(sessionKey, timeoutStr, call, login)
 		if !shouldRetry {
 			break
 		}
-		log.Println("Daemon: retrying", method, "on a fresh connection (attempt", attempt+1, "of", MAX_CALL_ATTEMPTS, ")")
+		log.Println("Daemon: retrying", call.method, "on a fresh connection (attempt", attempt+1, "of", MAX_CALL_ATTEMPTS, ")")
 	}
 	return out, err
 }
@@ -297,48 +363,96 @@ func (d *DaemonContext) maybeCreateSessionAndCall(sessionKey string, timeoutStr 
 	return out, err, shouldRetry
 }
 
-// acquireSession reserves an idle connection for sessionKey, or creates a new one.
-// The returned session must be handed back with release().
+// acquireSession reserves a slot on the least busy connection for sessionKey. A new connection
+// is only opened when all existing ones are full, no login is already running and the per-host
+// limit isn't reached; otherwise it waits for a slot. The returned session must be handed back
+// with release().
 func (d *DaemonContext) acquireSession(sessionKey string, login LoginInfo) (*TruenasSession, error) {
-	d.mapMtx.Lock()
-	futureSessions := d.sessionMap_[sessionKey]
-	channel := -1
-	for i := 0; i < len(futureSessions); i++ {
-		if futureSessions[i] == nil {
-			if channel < 0 {
-				channel = i
+	deadline := time.Now().Add(sessionAcquireTimeout)
+	for {
+		d.mapMtx.Lock()
+		futureSessions := d.sessionMap_[sessionKey]
+		channel := -1
+		used := 0
+		pending := 0
+		var best *TruenasSession
+		bestLoad := 0
+		for i := 0; i < len(futureSessions); i++ {
+			if futureSessions[i] == nil {
+				if channel < 0 {
+					channel = i
+				}
+				continue
+			}
+			used++
+			done, session, err := futureSessions[i].Peek()
+			if !done {
+				pending++
+				continue
+			}
+			if err != nil || session == nil {
+				continue
+			}
+			if load, ok := session.load(); ok && (best == nil || load < bestLoad) {
+				best = session
+				bestLoad = load
+			}
+		}
+		if best != nil {
+			d.mapMtx.Unlock()
+			if best.tryReserve() {
+				return best, nil
 			}
 			continue
 		}
-		done, session, err := futureSessions[i].Peek()
-		if !done || err != nil || session == nil {
-			continue
-		}
-		if session.tryReserve() {
+		if pending == 0 && used < maxSessionsPerHost {
+			if channel < 0 {
+				channel = len(futureSessions)
+				futureSessions = append(futureSessions, nil)
+			}
+			future := MakeFuture[*TruenasSession]()
+			futureSessions[channel] = future
+			d.sessionMap_[sessionKey] = futureSessions
 			d.mapMtx.Unlock()
-			return session, nil
-		}
-	}
-	if channel < 0 {
-		channel = len(futureSessions)
-		futureSessions = append(futureSessions, nil)
-	}
-	future := MakeFuture[*TruenasSession]()
-	futureSessions[channel] = future
-	d.sessionMap_[sessionKey] = futureSessions
-	d.mapMtx.Unlock()
 
-	s, err := d.createSession(sessionKey, login, channel, future)
-	if err == nil && s == nil {
-		err = fmt.Errorf("Failed to launch TrueNAS client session (unknown error)")
+			s, err := d.createSession(sessionKey, login, channel, future)
+			if err == nil && s == nil {
+				err = fmt.Errorf("Failed to launch TrueNAS client session (unknown error)")
+			}
+			if err != nil {
+				future.Fail(err)
+				d.removeSession(sessionKey, channel, future)
+				return nil, err
+			}
+			future.Complete(s)
+			d.notifySessionsChanged()
+			return s, nil
+		}
+		changed := d.sessionsChanged_
+		d.mapMtx.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("Timed out waiting for a free TrueNAS connection (exceeded %s)", sessionAcquireTimeout.String())
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-changed:
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
-	if err != nil {
-		future.Fail(err)
-		d.removeSession(sessionKey, channel, future)
-		return nil, err
-	}
-	future.Complete(s)
-	return s, nil
+}
+
+func (d *DaemonContext) notifySessionsChanged() {
+	d.mapMtx.Lock()
+	defer d.mapMtx.Unlock()
+	d.notifySessionsChangedLocked()
+}
+
+func (d *DaemonContext) notifySessionsChangedLocked() {
+	close(d.sessionsChanged_)
+	d.sessionsChanged_ = make(chan struct{})
 }
 
 func (d *DaemonContext) createSession(sessionKey string, login LoginInfo, channel int, future *Future[*TruenasSession]) (*TruenasSession, error) {
@@ -354,7 +468,8 @@ func (d *DaemonContext) createSession(sessionKey string, login LoginInfo, channe
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: login.allowInsecure,
 		},
-		Proxy: http.ProxyFromEnvironment,
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: sessionHandshakeTimeout,
 	}
 
 	// Establish the WebSocket connection
@@ -455,6 +570,7 @@ func (d *DaemonContext) removeSession(sessionKey string, channel int, future *Fu
 		return
 	}
 	sessionList[channel] = nil
+	d.notifySessionsChangedLocked()
 	for _, f := range sessionList {
 		if f != nil {
 			return
@@ -463,10 +579,21 @@ func (d *DaemonContext) removeSession(sessionKey string, channel int, future *Fu
 	delete(d.sessionMap_, sessionKey)
 }
 
+// discardSession takes the session out of the pool. Other calls still running on the
+// connection are allowed to finish before it is shut down.
 func (d *DaemonContext) discardSession(s *TruenasSession, logout bool) {
-	s.markClosing()
 	d.removeSession(s.sessionKey, s.channel, s.future)
-	s.shutdown(logout)
+	s.connMtx.Lock()
+	s.closing_ = true
+	idle := s.inFlight_ == 0
+	if !idle {
+		s.drain_ = true
+		s.drainLogout_ = logout
+	}
+	s.connMtx.Unlock()
+	if idle {
+		s.shutdown(logout)
+	}
 }
 
 func (d *DaemonContext) reapIdleSessions() {
@@ -524,10 +651,17 @@ func (d *DaemonContext) closeAllSessions() {
 	wg.Wait()
 }
 
+// load returns the number of calls in flight and whether the session can take another one
+func (s *TruenasSession) load() (int, bool) {
+	s.connMtx.Lock()
+	defer s.connMtx.Unlock()
+	return s.inFlight_, !s.closing_ && s.inFlight_ < maxCallsPerSession
+}
+
 func (s *TruenasSession) tryReserve() bool {
 	s.connMtx.Lock()
 	defer s.connMtx.Unlock()
-	if s.closing_ || s.inFlight_ > 0 {
+	if s.closing_ || s.inFlight_ >= maxCallsPerSession {
 		return false
 	}
 	s.inFlight_++
@@ -537,11 +671,21 @@ func (s *TruenasSession) tryReserve() bool {
 
 func (s *TruenasSession) release() {
 	s.connMtx.Lock()
-	defer s.connMtx.Unlock()
 	if s.inFlight_ > 0 {
 		s.inFlight_--
 	}
 	s.lastUsed_ = time.Now()
+	drain := s.drain_ && s.inFlight_ == 0
+	if drain {
+		s.drain_ = false
+	}
+	logout := s.drainLogout_
+	s.connMtx.Unlock()
+
+	if drain {
+		go s.shutdown(logout)
+	}
+	s.ctx.notifySessionsChanged()
 }
 
 func (s *TruenasSession) markClosing() {
@@ -563,6 +707,10 @@ func (s *TruenasSession) tryMarkIdleClosing(now time.Time, idleTimeout time.Dura
 // shutdown disconnects cleanly: optional auth.logout, then a WebSocket close handshake,
 // so the TrueNAS middleware can drop the session instead of keeping it around.
 func (s *TruenasSession) shutdown(logout bool) {
+	s.shutdownOnce.Do(func() { s.shutdownImpl(logout) })
+}
+
+func (s *TruenasSession) shutdownImpl(logout bool) {
 	s.markClosing()
 	if logout {
 		if out, err, _ := s.callJson("auth.logout", sessionLogoutTimeout, []interface{}{}); err != nil {

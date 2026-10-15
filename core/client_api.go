@@ -23,10 +23,18 @@ type ClientSession struct {
 	SocketPath string
 	IsDebug bool
 	AllowInsecure bool
+	DaemonMaxConnections int
+	DaemonMaxCalls int
+	DaemonSnapshotCacheTtl string
 	client *http.Client
 	timeout time.Duration
 	jobsList []int64
 	mapSkipWaitOnClose map[int64]bool
+}
+
+// each call is its own HTTP request to the daemon
+func (s *ClientSession) SupportsConcurrentCalls() bool {
+	return true
 }
 
 func (s *ClientSession) IsLoggedIn() bool {
@@ -68,7 +76,7 @@ func (s *ClientSession) Login() error {
 
 	st, err := os.Stat(s.SocketPath)
 	if err != nil {
-		if err = launchDaemonAndAwaitSocket(s.SocketPath, s.timeout, nil); err != nil {
+		if err = launchDaemonAndAwaitSocket(s.SocketPath, s.timeout, s.daemonLimitArgs(), nil); err != nil {
 			return fmt.Errorf("launchDaemonAndAwaitSocket: %v", err)
 		}
 		st, err = os.Stat(s.SocketPath)
@@ -225,11 +233,26 @@ call:
 	return data, err, true
 }
 
-func launchDaemon(thisExec string, socketPath string, daemonTimeout time.Duration) error {
+func (s *ClientSession) daemonLimitArgs() []string {
+	args := make([]string, 0)
+	if s.DaemonMaxConnections > 0 {
+		args = append(args, fmt.Sprintf("--max-connections=%d", s.DaemonMaxConnections))
+	}
+	if s.DaemonMaxCalls > 0 {
+		args = append(args, fmt.Sprintf("--max-calls=%d", s.DaemonMaxCalls))
+	}
+	if s.DaemonSnapshotCacheTtl != "" {
+		args = append(args, "--snapshot-cache-ttl=" + s.DaemonSnapshotCacheTtl)
+	}
+	return args
+}
+
+func launchDaemon(thisExec string, socketPath string, daemonTimeout time.Duration, extraArgs []string) error {
 	cmd := []string { "daemon" }
 	if daemonTimeout >= time.Second {
 		cmd = append(cmd, "-t", daemonTimeout.String())
 	}
+	cmd = append(cmd, extraArgs...)
 	cmd = append(cmd, socketPath)
 
 	if err := exec.Command(thisExec, cmd...).Start(); err != nil {
@@ -238,7 +261,7 @@ func launchDaemon(thisExec string, socketPath string, daemonTimeout time.Duratio
 	return nil
 }
 
-func launchDaemonAndAwaitSocket(socketPath string, daemonTimeout time.Duration, optWarningBuilder *strings.Builder) error {
+func launchDaemonAndAwaitSocket(socketPath string, daemonTimeout time.Duration, extraArgs []string, optWarningBuilder *strings.Builder) error {
 	thisExec, err := os.Executable()
 	if err != nil {
 		return err
@@ -261,7 +284,7 @@ func launchDaemonAndAwaitSocket(socketPath string, daemonTimeout time.Duration, 
 		})
 	}()
 
-	if err = launchDaemon(thisExec, socketPath, daemonTimeout); err != nil {
+	if err = launchDaemon(thisExec, socketPath, daemonTimeout, extraArgs); err != nil {
 		return err
 	}
 

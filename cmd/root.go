@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"time"
 	"truenas/truenas_incus_ctl/core"
 
 	"github.com/spf13/cobra"
@@ -30,6 +31,9 @@ var g_configFileName string
 var g_configName string
 var g_hostName string
 var g_apiKey string
+var g_daemonMaxConnections int
+var g_daemonMaxCalls int
+var g_daemonSnapshotCacheTtl string
 
 func Execute() {
 	err := rootCmd.Execute()
@@ -49,6 +53,9 @@ func init() {
 
 	daemonCmd.Flags().StringP("timeout", "t", "", "Exit the daemon if no communication occurs after this duration")
 	daemonCmd.Flags().StringP("session-idle-timeout", "i", "", "Log out and close TrueNAS connections that were idle for this duration (default 2m, 0 disables)")
+	daemonCmd.Flags().Int("max-connections", core.DEFAULT_MAX_SESSIONS_PER_HOST, "Maximum number of connections (and logins) per TrueNAS host")
+	daemonCmd.Flags().Int("max-calls", core.DEFAULT_MAX_CALLS_PER_SESSION, "Maximum number of parallel calls per connection; further calls wait for a free slot")
+	daemonCmd.Flags().String("snapshot-cache-ttl", "", "Fetch all snapshots once for concurrent zfs.snapshot.query calls and keep them for this duration (default 5s, 0 only shares running fetches, negative disables)")
 
 	rootCmd.AddCommand(daemonCmd)
 }
@@ -73,11 +80,14 @@ func runDaemon(cmd *cobra.Command, args []string) {
 	if f := cmd.Flags().Lookup("session-idle-timeout"); f != nil {
 		sessionIdleTimeoutStr = f.Value.String()
 	}
+	maxConnections, _ := cmd.Flags().GetInt("max-connections")
+	maxCalls, _ := cmd.Flags().GetInt("max-calls")
+	snapshotCacheTtlStr, _ := cmd.Flags().GetString("snapshot-cache-ttl")
 	serverSockAddr := args[0]
 	if serverSockAddr == "" {
 		log.Fatal("Error: path to server socket was not provided")
 	}
-	core.RunDaemon(serverSockAddr, globalTimeoutStr, sessionIdleTimeoutStr)
+	core.RunDaemon(serverSockAddr, globalTimeoutStr, sessionIdleTimeoutStr, maxConnections, maxCalls, snapshotCacheTtlStr)
 }
 
 func InitializeApiClient() core.Session {
@@ -100,6 +110,7 @@ func InitializeApiClient() core.Session {
 		}
 	}
 	if USE_DAEMON {
+		applyDaemonSettings(loadDaemonSettings(g_configFileName))
 		socketPath := g_daemonSocketOverride
 		if socketPath == "" {
 			p, err := getHomeDirWithFallback()
@@ -114,6 +125,10 @@ func InitializeApiClient() core.Session {
 			SocketPath:    socketPath,
 			IsDebug:       g_debug,
 			AllowInsecure: g_allowInsecure,
+
+			DaemonMaxConnections:   g_daemonMaxConnections,
+			DaemonMaxCalls:         g_daemonMaxCalls,
+			DaemonSnapshotCacheTtl: g_daemonSnapshotCacheTtl,
 		}
 	} else {
 		api = &core.RealSession{
@@ -125,6 +140,79 @@ func InitializeApiClient() core.Session {
 	}
 
 	return api
+}
+
+type daemonSettings struct {
+	maxConnections   int
+	maxCalls         int
+	snapshotCacheTtl string
+}
+
+// The daemon is shared by all hosts, so its settings live in an optional top-level "daemon"
+// section of the config file. It's read even when --host and --api-key are given (as Incus does):
+//
+//	"daemon": {"max_connections": 2, "max_calls": 4, "snapshot_cache_ttl": "5s"}
+//
+// The settings are passed to the daemon when it gets launched; a daemon that is already
+// running keeps its settings until it exits. Invalid values are reported and ignored.
+func loadDaemonSettings(fileName string) daemonSettings {
+	settings := daemonSettings{}
+	if fileName == "" {
+		fileName = getDefaultConfigPath()
+	}
+	data, err := os.ReadFile(fileName)
+	if err != nil && fileName != getDefaultConfigPath() {
+		fileName = getDefaultConfigPath()
+		data, err = os.ReadFile(fileName)
+	}
+	if err != nil {
+		return settings
+	}
+	var config map[string]interface{}
+	if json.Unmarshal(data, &config) != nil {
+		return settings
+	}
+	daemon, exists := config["daemon"]
+	if !exists {
+		return settings
+	}
+	daemonMap, ok := daemon.(map[string]interface{})
+	if !ok {
+		warnDaemonSetting(fileName, "daemon", "an object")
+		return settings
+	}
+	readCount := func(key string) int {
+		value, exists := daemonMap[key]
+		if !exists {
+			return 0
+		}
+		if n, ok := value.(float64); ok && n >= 1 && n == float64(int(n)) {
+			return int(n)
+		}
+		warnDaemonSetting(fileName, "daemon."+key, "a whole number >= 1")
+		return 0
+	}
+	settings.maxConnections = readCount("max_connections")
+	settings.maxCalls = readCount("max_calls")
+	if value, exists := daemonMap["snapshot_cache_ttl"]; exists {
+		str, _ := value.(string)
+		if _, err := time.ParseDuration(str); err == nil {
+			settings.snapshotCacheTtl = str
+		} else {
+			warnDaemonSetting(fileName, "daemon.snapshot_cache_ttl", "a duration like \"5s\"")
+		}
+	}
+	return settings
+}
+
+func warnDaemonSetting(fileName, key, expected string) {
+	fmt.Fprintf(os.Stderr, "Warning: ignoring %s in \"%s\": expected %s\n", key, fileName, expected)
+}
+
+func applyDaemonSettings(settings daemonSettings) {
+	g_daemonMaxConnections = settings.maxConnections
+	g_daemonMaxCalls = settings.maxCalls
+	g_daemonSnapshotCacheTtl = settings.snapshotCacheTtl
 }
 
 // This method is called assuming that we're missing either a hostname or api key.

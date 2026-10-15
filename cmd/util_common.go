@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"truenas/truenas_incus_ctl/core"
 )
 
@@ -38,19 +39,142 @@ func BuildNameStrAndPropertiesJson(options FlagMap, nameStr string) []interface{
 	return []interface{}{nameStr, outMap}
 }
 
-func QueryApi(api core.Session, category string, entries, entryTypes, propsList []string, params typeQueryParams) (typeQueryResponse, error) {
-	response := typeQueryResponse{}
-	endpoint := category + ".query"
-	isNfs := endpoint == "sharing.nfs.query"
+// The TrueNAS 25.10 middleware mishandles OR filters: filter_getattrs() only copes with ORs of
+// exactly two branches, and a chain nested deeper than this hangs the call (three recursively
+// queried datasets already time out) or gets rejected. Deeper filters are split into queries
+// per entry type and per recursively queried dataset, which are run in parallel if possible.
+const maxQueryFilterOrDepth = 3
 
+func QueryApi(api core.Session, category string, entries, entryTypes, propsList []string, params typeQueryParams) (typeQueryResponse, error) {
 	if len(entryTypes) != len(entries) {
-		return response, fmt.Errorf("length mismatch between entries and entry types: %d != %d", len(entries), len(entryTypes))
+		return typeQueryResponse{}, fmt.Errorf("length mismatch between entries and entry types: %d != %d", len(entries), len(entryTypes))
 	}
 
 	filter, err := makeQueryFilter(entries, entryTypes, params)
 	if err != nil {
-		return response, err
+		return typeQueryResponse{}, err
 	}
+	if getFilterOrDepth(filter) <= maxQueryFilterOrDepth {
+		return queryApiWithFilter(api, category, filter, propsList, params)
+	}
+
+	groups := splitQueryEntries(entries, entryTypes, params)
+	responses := make([]typeQueryResponse, len(groups))
+	errs := make([]error, len(groups))
+	queryGroup := func(i int) {
+		groupFilter, err := makeQueryFilter(groups[i].entries, groups[i].entryTypes, params)
+		if err == nil {
+			responses[i], err = queryApiWithFilter(api, category, groupFilter, propsList, params)
+		}
+		errs[i] = err
+	}
+	if core.SupportsConcurrentCalls(api) {
+		if err := core.MaybeLogin(api); err != nil {
+			return typeQueryResponse{}, err
+		}
+		var wg sync.WaitGroup
+		for i := range groups {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				queryGroup(i)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := range groups {
+			queryGroup(i)
+		}
+	}
+
+	combined := typeQueryResponse{
+		resultsMap: make(map[string]map[string]interface{}),
+		intKeys:    make([]int, 0),
+		strKeys:    make([]string, 0),
+	}
+	for i := range groups {
+		if errs[i] != nil {
+			return typeQueryResponse{}, errs[i]
+		}
+		MergeResponseInto(&combined, &responses[i])
+	}
+	if params.shouldSkipKeyBuild {
+		combined.intKeys = make([]int, 0)
+		combined.strKeys = make([]string, 0)
+	}
+	return combined, nil
+}
+
+type queryEntryGroup struct {
+	entries    []string
+	entryTypes []string
+}
+
+// splitQueryEntries groups entries by type; recursively queried datasets get a group each
+func splitQueryEntries(entries, entryTypes []string, params typeQueryParams) []queryEntryGroup {
+	groups := make([]queryEntryGroup, 0)
+	typeIndex := make(map[string]int)
+	for i := range entries {
+		if params.shouldRecurse && entryTypes[i] == "dataset" {
+			groups = append(groups, queryEntryGroup{[]string{entries[i]}, []string{entryTypes[i]}})
+			continue
+		}
+		idx, exists := typeIndex[entryTypes[i]]
+		if !exists {
+			idx = len(groups)
+			typeIndex[entryTypes[i]] = idx
+			groups = append(groups, queryEntryGroup{})
+		}
+		groups[idx].entries = append(groups[idx].entries, entries[i])
+		groups[idx].entryTypes = append(groups[idx].entryTypes, entryTypes[i])
+	}
+	return groups
+}
+
+// getFilterOrDepth returns how deeply OR conditions are nested in a query filter
+func getFilterOrDepth(filters []interface{}) int {
+	maxDepth := 0
+	for _, f := range filters {
+		cond := asInterfaceList(f)
+		if len(cond) != 2 || cond[0] != "OR" {
+			continue
+		}
+		depth := 1
+		for _, b := range asInterfaceList(cond[1]) {
+			branch := asInterfaceList(b)
+			if len(branch) == 0 {
+				continue
+			}
+			if _, isString := branch[0].(string); isString {
+				depth = max(depth, 1+getFilterOrDepth([]interface{}{branch}))
+			} else {
+				depth = max(depth, 1+getFilterOrDepth(branch)) // conjunction
+			}
+		}
+		maxDepth = max(maxDepth, depth)
+	}
+	return maxDepth
+}
+
+// filters are built from both []interface{} and [][]interface{} (see constructORChain)
+func asInterfaceList(value interface{}) []interface{} {
+	switch v := value.(type) {
+	case []interface{}:
+		return v
+	case [][]interface{}:
+		list := make([]interface{}, len(v))
+		for i := range v {
+			list[i] = v[i]
+		}
+		return list
+	}
+	return nil
+}
+
+func queryApiWithFilter(api core.Session, category string, filter []interface{}, propsList []string, params typeQueryParams) (typeQueryResponse, error) {
+	response := typeQueryResponse{}
+	endpoint := category + ".query"
+	isNfs := endpoint == "sharing.nfs.query"
 
 	query := []interface{}{filter}
 	if !isNfs {
