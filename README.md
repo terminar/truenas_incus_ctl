@@ -88,6 +88,16 @@ When debugging or testing, it can be useful to prelaunch the daemon to view its 
 
 `sudo /home/<user>/go/bin/truenas_incus_ctl daemon /home/<user>/tncdaemon.sock`
 
+The daemon limits and shares the calls it makes to TrueNAS. Its settings can be given in an optional top-level `daemon` section of `config.json` (also when `--host`/`--api-key` are passed, as Incus does); they are applied when the daemon gets launched:
+
+```json
+"daemon": {"max_connections": 2, "max_calls": 4, "snapshot_cache_ttl": "5s", "snapshot_cache_mode": "query"}
+```
+
+- `max_connections` / `max_calls`: connections (logins) per TrueNAS host and parallel calls per connection.
+- `snapshot_cache_ttl`: how long `zfs.snapshot.query` results are shared (`0` only shares queries running at the same time, negative disables sharing).
+- `snapshot_cache_mode`: `query` (default) sends identical queries once; `all` fetches all snapshots once and filters in the daemon. Use `query` with the [snapshot query scope](#snapshot-query-scope) patch and `all` on an unpatched TrueNAS 25.10.
+
 ## Middleware Patches
 
 The following patches may be useful to support the Incus TrueNAS driver. 
@@ -95,6 +105,8 @@ The following patches may be useful to support the Incus TrueNAS driver.
 - [back-port zfs.snapshot.rename functionality](#zfssnapshotrename-backport)
 - [increase max_calls](#increase-max-api-calls)
 - [iSCSI defer functionality](#iscsi-defer-functionality)
+- [session leak fix](#session-leak-fix)
+- [snapshot query scope](#snapshot-query-scope)
 
 The middlewared source on a TrueNAS installation is located at `/usr/lib/python3/dist-packages/middlewared`
 
@@ -174,6 +186,43 @@ The iscsi target deletion improvement improves iscsi deletion operations by abou
 improvement.
 
 When performance/integration testing the Incus driver, you may want to apply this patch if it is not already applied, as it can significantly reduce the runtime of integration tests.
+
+### Session leak fix
+
+On TrueNAS 25.10 the middleware can keep API sessions in `auth.sessions` although their WebSocket connection is long gone. They pile up (visible under System → Advanced → Access, which eventually stops loading) and `auth.terminate_session` can not remove them. Two causes in `plugins/auth.py`:
+
+1. **Disconnect during login:** `SessionManager.login` registers its CLOSE callback only after the (PAM) login finished. If the client disconnects while the login is still running, the CLOSE callbacks have already run, so the session is never removed.
+2. **Failing logout:** `SessionManager.logout` writes the audit log entry before removing the session. If that raises, the session stays.
+
+Additionally `auth.terminate_session` only closes the WebSocket; for an already closed connection that is a no-op, so orphaned sessions survive.
+
+[`patches/middlewared-25.10-session-leak.patch`](patches/middlewared-25.10-session-leak.patch) fixes all three: login detects a disconnect that happened during login, logout removes the session first and tolerates audit/PAM errors, and `terminate_session` always logs the session out.
+
+disable the [/usr readonly protection](#removing-usr-read-only-protection), then apply the patch and [restart the middleware](#restarting-middlewared) (which also clears all orphaned sessions)
+
+```sh
+cd /usr/lib/python3/dist-packages
+patch -p3 --dry-run < /root/middlewared-25.10-session-leak.patch && patch -p3 < /root/middlewared-25.10-session-leak.patch
+```
+
+To revert, run the same command with `-R`. The patch was made against the `TS-25.10.0` tag; on other versions check the `--dry-run` output first.
+
+[`scripts/tn_stale_sessions.py`](scripts/tn_stale_sessions.py) lists sessions without a TCP connection (dry run by default, `--help` for filters) and terminates them with `--apply`; with the patch applied this also removes orphaned sessions.
+
+### Snapshot query scope
+
+Except for a single `id`/`name` lookup, `zfs.snapshot.query` in TrueNAS 25.10 reads *all* snapshots of the system with their properties and filters them afterwards (`plugins/zfs_/snapshot.py`, `# FIXME: awful performance with hundreds/thousands of snapshots`). Incus queries the snapshots of every instance, so with daily recursive snapshots each of these queries costs as much as listing everything. Measured with 2468 snapshots: all snapshots 1.02s, the 17 snapshots of one container 0.01s.
+
+[`patches/middlewared-25.10-snapshot-query-scope.patch`](patches/middlewared-25.10-snapshot-query-scope.patch) makes libzfs only read the snapshots of the datasets a filter is limited to (`dataset` with `=`, `in`, `^ "<dataset>/"`, and OR combinations of those, as sent by `truenas_incus_ctl list -r`). The exact filters are still applied afterwards, so results do not change; if a dataset does not exist, all snapshots are read as before.
+
+disable the [/usr readonly protection](#removing-usr-read-only-protection), then apply the patch and [restart the middleware](#restarting-middlewared)
+
+```sh
+cd /usr/lib/python3/dist-packages
+patch -p3 --dry-run < /root/middlewared-25.10-snapshot-query-scope.patch && patch -p3 < /root/middlewared-25.10-snapshot-query-scope.patch
+```
+
+Without this patch, set `"snapshot_cache_mode": "all"` in the [daemon settings](#daemon-mode).
 
 ### Restarting Middlewared
 

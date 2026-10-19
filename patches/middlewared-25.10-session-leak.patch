@@ -1,0 +1,67 @@
+diff -ru a/src/middlewared/middlewared/api/base/server/ws_handler/rpc.py b/src/middlewared/middlewared/api/base/server/ws_handler/rpc.py
+--- a/src/middlewared/middlewared/api/base/server/ws_handler/rpc.py
++++ b/src/middlewared/middlewared/api/base/server/ws_handler/rpc.py
+@@ -262,6 +262,8 @@
+                     )
+                     break
+         finally:
++            # Lets SessionManager.login detect a disconnect that happened while it was running
++            app.connection_closed = True
+             await app.run_callback(RpcWebSocketAppEvent.CLOSE)
+ 
+             await self.middleware.event_source_manager.unsubscribe_app(app)
+diff -ru a/src/middlewared/middlewared/plugins/auth.py b/src/middlewared/middlewared/plugins/auth.py
+--- a/src/middlewared/middlewared/plugins/auth.py
++++ b/src/middlewared/middlewared/plugins/auth.py
+@@ -161,18 +161,31 @@
+                 "error": None,
+             }, True)
+ 
++        if getattr(app, "connection_closed", False):
++            # The client disconnected while credentials.login was still running. The CLOSE callbacks
++            # have already been run at that point, so _app_on_close would never fire and the session
++            # would stay in self.sessions forever.
++            await self.logout(app)
++
+     async def logout(self, app):
+-        if session := self.sessions.get(app.session_id):
++        # Remove the session first, so that a failing audit log / PAM call can not leave it behind,
++        # and concurrent calls (CLOSE callback + terminate_session) only log out once.
++        if session := self.sessions.pop(app.session_id, None):
+             if not (internal_session := is_internal_session(session)):
+-                await self.middleware.log_audit_message(app, "LOGOUT", {
+-                    "credentials": dump_credentials(app.authenticated_credentials),
+-                }, True)
++                try:
++                    await self.middleware.log_audit_message(app, "LOGOUT", {
++                        "credentials": dump_credentials(app.authenticated_credentials),
++                    }, True)
++                except Exception:
++                    self.middleware.logger.error("Failed to log LOGOUT audit message", exc_info=True)
+ 
+-            del self.sessions[app.session_id]
+             app.authentication_context = None
+             app.authenticated_credentials = None
+ 
+-            await self.middleware.run_in_thread(session.credentials.logout)
++            try:
++                await self.middleware.run_in_thread(session.credentials.logout)
++            except Exception:
++                self.middleware.logger.error("Failed to log out session credentials", exc_info=True)
+ 
+             if not internal_session:
+                 self.middleware.send_event("auth.sessions", "REMOVED", fields=dict(id=app.session_id))
+@@ -308,7 +321,12 @@
+ 
+         self.token_manager.destroy_by_session_id(id_)
+ 
+-        await session.app.ws.close()
++        try:
++            await session.app.ws.close()
++        finally:
++            # If the websocket was already gone, closing it again does not trigger the CLOSE callbacks,
++            # so the (orphaned) session has to be removed here. logout() is idempotent.
++            await self.session_manager.logout(session.app)
+         return True
+ 
+     @api_method(AuthTerminateOtherSessionsArgs, AuthTerminateOtherSessionsResult, roles=['AUTH_SESSIONS_WRITE'])

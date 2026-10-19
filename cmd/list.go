@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"truenas/truenas_incus_ctl/core"
 
 	"github.com/spf13/cobra"
@@ -197,9 +198,11 @@ func doList(cmd *cobra.Command, api core.Session, args []string) error {
 	combinedResponse.intKeys = make([]int, 0)
 	combinedResponse.strKeys = make([]string, 0)
 
-	for _, qType := range allTypes {
+	responses := make([]typeQueryResponse, len(allTypes))
+	queryErrors := make([]error, len(allTypes))
+	queryType := func(i int) {
 		var category string
-		switch qType {
+		switch allTypes[i] {
 		case "dataset":
 			category = "pool.dataset"
 		case "snapshot":
@@ -207,10 +210,34 @@ func doList(cmd *cobra.Command, api core.Session, args []string) error {
 		case "nfs":
 			category = "sharing.nfs"
 		}
-		response, err := QueryApi(api, category, qEntriesMap[qType], qEntryTypesMap[qType], properties, extras)
-		if err != nil {
+		responses[i], queryErrors[i] = QueryApi(api, category, qEntriesMap[allTypes[i]], qEntryTypesMap[allTypes[i]], properties, extras)
+	}
+
+	// e.g. datasets and snapshots for "list -r -t filesystem,volume,snapshot" are independent queries
+	if len(allTypes) > 1 && core.SupportsConcurrentCalls(api) {
+		if err := core.MaybeLogin(api); err != nil {
 			return err
 		}
+		var wg sync.WaitGroup
+		for i := range allTypes {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				queryType(i)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := range allTypes {
+			queryType(i)
+		}
+	}
+
+	for i, qType := range allTypes {
+		if queryErrors[i] != nil {
+			return queryErrors[i]
+		}
+		response := responses[i]
 
 		filterType := ""
 		if qType == "dataset" {
