@@ -18,6 +18,8 @@ func TestLoadDaemonSettings(t *testing.T) {
 		{"no daemon section", `{"hosts":{}}`, daemonSettings{}},
 		{"invalid values are ignored", `{"daemon":{"max_connections":0,"max_calls":2.5,"snapshot_cache_ttl":"soon"}}`, daemonSettings{}},
 		{"cache disabled", `{"daemon":{"snapshot_cache_ttl":"-1s"}}`, daemonSettings{snapshotCacheTtl: "-1s"}},
+		{"cache mode all", `{"daemon":{"snapshot_cache_mode":"all"}}`, daemonSettings{snapshotCacheMode: "all"}},
+		{"invalid cache mode is ignored", `{"daemon":{"snapshot_cache_mode":"everything"}}`, daemonSettings{}},
 	}
 	for _, c := range cases {
 		fileName := filepath.Join(t.TempDir(), "config.json")

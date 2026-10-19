@@ -26,6 +26,7 @@ type ClientSession struct {
 	DaemonMaxConnections int
 	DaemonMaxCalls int
 	DaemonSnapshotCacheTtl string
+	DaemonSnapshotCacheMode string
 	client *http.Client
 	timeout time.Duration
 	jobsList []int64
@@ -243,6 +244,9 @@ func (s *ClientSession) daemonLimitArgs() []string {
 	}
 	if s.DaemonSnapshotCacheTtl != "" {
 		args = append(args, "--snapshot-cache-ttl=" + s.DaemonSnapshotCacheTtl)
+	}
+	if s.DaemonSnapshotCacheMode != "" {
+		args = append(args, "--snapshot-cache-mode=" + s.DaemonSnapshotCacheMode)
 	}
 	return args
 }

@@ -166,8 +166,7 @@ func (f *fakeTruenas) serve(fc *fakeConn) {
 			result := make([]map[string]interface{}, 0)
 			filters, _ := params[0].([]interface{})
 			for _, snap := range f.snapshots {
-				// the fake only understands "no filter" and the id fast path
-				if len(filters) == 0 || snap["id"] == filters[0].([]interface{})[2] {
+				if len(filters) == 0 || (isSupportedFilterList(filters) && matchesFilterList(snap, filters)) {
 					result = append(result, snap)
 				}
 			}
@@ -560,8 +559,11 @@ func snapshotNames(t *testing.T, out json.RawMessage) []string {
 	return names
 }
 
-func newCachingTestDaemon(t *testing.T, ttl time.Duration) *DaemonContext {
+var snapshotCacheModes = []string{SNAPSHOT_CACHE_MODE_QUERY, SNAPSHOT_CACHE_MODE_ALL}
+
+func newCachingTestDaemon(t *testing.T, ttl time.Duration, mode string) *DaemonContext {
 	d := newDaemonContext(0, 0, ttl)
+	d.snapshotCacheMode = mode
 	t.Cleanup(d.closeAllSessions)
 	return d
 }
@@ -574,7 +576,7 @@ func TestSnapshotQueriesShareOneFetch(t *testing.T) {
 	f := newFakeTruenas(t)
 	f.addSnapshots("tank/a@s1", "tank/a@s2", "tank/a/child@s1", "tank/ab@s1", "tank/b@s1")
 	f.snapshotDelay = 200 * time.Millisecond
-	d := newCachingTestDaemon(t, time.Second)
+	d := newCachingTestDaemon(t, time.Second, SNAPSHOT_CACHE_MODE_ALL)
 
 	expected := map[string]string{
 		"tank/a": "tank/a@s1,tank/a@s2,tank/a/child@s1", // children included, tank/ab not
@@ -612,10 +614,62 @@ func TestSnapshotQueriesShareOneFetch(t *testing.T) {
 	}
 }
 
+// In the default "query" mode identical queries are sent once, each with its own filter, so a
+// middleware with the snapshot-query-scope patch only reads the snapshots of that dataset
+func TestSnapshotQueryModeSharesIdenticalQueries(t *testing.T) {
+	f := newFakeTruenas(t)
+	f.addSnapshots("tank/a@s1", "tank/a@s2", "tank/a/child@s1", "tank/ab@s1", "tank/b@s1")
+	f.snapshotDelay = 200 * time.Millisecond
+	d := newCachingTestDaemon(t, time.Second, SNAPSHOT_CACHE_MODE_QUERY)
+
+	expected := map[string]string{
+		"tank/a": "tank/a@s1,tank/a@s2,tank/a/child@s1",
+		"tank/b": "tank/b@s1",
+		"tank/c": "",
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 30)
+	for i := 0; i < 30; i++ {
+		ds := []string{"tank/a", "tank/b", "tank/c"}[i%3]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err := snapshotQuery(d, f, recursiveDatasetFilter(ds))
+			if err == nil {
+				if got := strings.Join(snapshotNames(t, out), ","); got != expected[ds] {
+					err = fmt.Errorf("%s: got %q, want %q", ds, got, expected[ds])
+				}
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.snapshotQueryCount(); n != 3 {
+		t.Fatalf("expected one query per dataset, got %d", n)
+	}
+	for _, q := range f.snapshotQueries {
+		if filter := q.([]interface{}); len(filter) == 0 {
+			t.Fatalf("query mode must never fetch all snapshots, got filter %v", filter)
+		}
+	}
+}
+
 func TestSnapshotCacheIsInvalidatedByWrites(t *testing.T) {
+	for _, mode := range snapshotCacheModes {
+		t.Run(mode, func(t *testing.T) { testSnapshotCacheIsInvalidatedByWrites(t, mode) })
+	}
+}
+
+func testSnapshotCacheIsInvalidatedByWrites(t *testing.T, mode string) {
 	f := newFakeTruenas(t)
 	f.addSnapshots("tank/a@s1")
-	d := newCachingTestDaemon(t, time.Minute)
+	d := newCachingTestDaemon(t, time.Minute, mode)
 
 	for i := 0; i < 3; i++ {
 		if _, err := snapshotQuery(d, f, recursiveDatasetFilter("tank/a")); err != nil {
@@ -647,10 +701,16 @@ func TestSnapshotCacheIsInvalidatedByWrites(t *testing.T) {
 }
 
 func TestSnapshotFetchRunningDuringWriteIsNotReused(t *testing.T) {
+	for _, mode := range snapshotCacheModes {
+		t.Run(mode, func(t *testing.T) { testSnapshotFetchRunningDuringWriteIsNotReused(t, mode) })
+	}
+}
+
+func testSnapshotFetchRunningDuringWriteIsNotReused(t *testing.T, mode string) {
 	f := newFakeTruenas(t)
 	f.addSnapshots("tank/a@s1")
 	f.snapshotDelay = 300 * time.Millisecond
-	d := newCachingTestDaemon(t, time.Minute)
+	d := newCachingTestDaemon(t, time.Minute, mode)
 
 	first := make(chan error, 1)
 	go func() {
@@ -674,9 +734,15 @@ func TestSnapshotFetchRunningDuringWriteIsNotReused(t *testing.T) {
 }
 
 func TestSnapshotCacheExpires(t *testing.T) {
+	for _, mode := range snapshotCacheModes {
+		t.Run(mode, func(t *testing.T) { testSnapshotCacheExpires(t, mode) })
+	}
+}
+
+func testSnapshotCacheExpires(t *testing.T, mode string) {
 	f := newFakeTruenas(t)
 	f.addSnapshots("tank/a@s1")
-	d := newCachingTestDaemon(t, 50*time.Millisecond)
+	d := newCachingTestDaemon(t, 50*time.Millisecond, mode)
 
 	if _, err := snapshotQuery(d, f, recursiveDatasetFilter("tank/a")); err != nil {
 		t.Fatal(err)
@@ -691,9 +757,15 @@ func TestSnapshotCacheExpires(t *testing.T) {
 }
 
 func TestSnapshotQueriesBypassingTheCache(t *testing.T) {
+	for _, mode := range snapshotCacheModes {
+		t.Run(mode, func(t *testing.T) { testSnapshotQueriesBypassingTheCache(t, mode) })
+	}
+}
+
+func testSnapshotQueriesBypassingTheCache(t *testing.T, mode string) {
 	f := newFakeTruenas(t)
 	f.addSnapshots("tank/a@s1", "tank/a@s2")
-	d := newCachingTestDaemon(t, time.Minute)
+	d := newCachingTestDaemon(t, time.Minute, mode)
 
 	// the middleware's own fast path for a single snapshot is cheaper than fetching everything
 	out, err := snapshotQuery(d, f, []interface{}{[]interface{}{"id", "=", "tank/a@s2"}})

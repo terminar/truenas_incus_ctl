@@ -1,0 +1,76 @@
+diff -ru sa/src/middlewared/middlewared/plugins/zfs_/snapshot.py sb/src/middlewared/middlewared/plugins/zfs_/snapshot.py
+--- sa/src/middlewared/middlewared/plugins/zfs_/snapshot.py
++++ sb/src/middlewared/middlewared/plugins/zfs_/snapshot.py
+@@ -10,6 +10,48 @@
+ from .validation_utils import validate_snapshot_name
+ 
+ 
++def snapshot_query_dataset_scope(filters):
++    """
++    Returns the datasets whose snapshots (recursively) are a superset of everything `filters` can match,
++    or None if the filters do not restrict the dataset. Understands `dataset` filters with `=`, `in`
++    and `^` (with a trailing slash), and OR conditions of those, e.g. the common recursive listing
++    ["OR", [["dataset", "=", "tank/ds"], ["dataset", "^", "tank/ds/"]]].
++    """
++    for f in filters:
++        # filters are ANDed, so any single restricting filter limits the result
++        if (roots := _filter_dataset_scope(f)) is not None:
++            roots = sorted(set(roots))
++            # drop datasets that are already covered recursively by one of their parents
++            return [r for r in roots if not any(r.startswith(p + '/') for p in roots if p != r)]
++    return None
++
++
++def _filter_dataset_scope(f):
++    if not isinstance(f, (list, tuple)):
++        return None
++    if len(f) == 2 and f[0] == 'OR' and isinstance(f[1], (list, tuple)) and f[1]:
++        roots = []
++        for branch in f[1]:
++            if branch and isinstance(branch, (list, tuple)) and isinstance(branch[0], (list, tuple)):
++                branch_roots = snapshot_query_dataset_scope(branch)  # conjunction of filters
++            else:
++                branch_roots = _filter_dataset_scope(branch)
++            if branch_roots is None:
++                return None
++            roots.extend(branch_roots)
++        return roots
++    if len(f) != 3 or f[0] != 'dataset':
++        return None
++    op, value = f[1], f[2]
++    if op == '=' and isinstance(value, str) and value:
++        return [value]
++    if op == 'in' and isinstance(value, (list, tuple)) and value and all(isinstance(v, str) and v for v in value):
++        return list(value)
++    if op == '^' and isinstance(value, str) and value.endswith('/') and value.strip('/'):
++        return [value.rstrip('/')]
++    return None
++
++
+ class ZFSSnapshotService(CRUDService):
+ 
+     class Config:
+@@ -114,8 +156,21 @@
+                     'id', 'name'
+             ) and filters[0][1] == '=':
+                 kwargs['datasets'] = [filters[0][2]]
+-
+-            snapshots = zfs.snapshots_serialized(**kwargs)
++            elif scope := snapshot_query_dataset_scope(filters):
++                # Only read the snapshots of the filtered datasets instead of all snapshots in the system;
++                # filter_list below still applies the exact filters.
++                kwargs['datasets'] = scope
++                kwargs['recursive'] = True
++
++            try:
++                snapshots = zfs.snapshots_serialized(**kwargs)
++            except libzfs.ZFSException:
++                if 'recursive' not in kwargs:
++                    raise
++                # e.g. one of the datasets does not exist (anymore): read all snapshots as before
++                kwargs.pop('datasets')
++                kwargs.pop('recursive')
++                snapshots = zfs.snapshots_serialized(**kwargs)
+ 
+         # FIXME: awful performance with hundreds/thousands of snapshots
+         select = options.pop('select', None)

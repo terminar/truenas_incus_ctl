@@ -82,6 +82,7 @@ type DaemonContext struct {
 	sessionMap_        map[string][]*Future[*TruenasSession]
 	sessionsChanged_   chan struct{}  // closed and replaced whenever a session frees up or goes away
 	snapshotCache      *snapshotCache // nil if disabled
+	snapshotCacheMode  string
 }
 
 type CallInfo struct {
@@ -113,10 +114,11 @@ func newDaemonContext(daemonTimeout time.Duration, sessionIdleTimeout time.Durat
 		sessionMap_:        make(map[string][]*Future[*TruenasSession]),
 		sessionsChanged_:   make(chan struct{}),
 		snapshotCache:      cache,
+		snapshotCacheMode:  DEFAULT_SNAPSHOT_CACHE_MODE,
 	}
 }
 
-func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeoutStr string, maxConnections int, maxCalls int, snapshotCacheTtlStr string) {
+func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeoutStr string, maxConnections int, maxCalls int, snapshotCacheTtlStr string, snapshotCacheMode string) {
 	var err error
 	var daemonTimeout time.Duration
 	if globalTimeoutStr != "" {
@@ -140,6 +142,11 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeou
 			log.Fatal("Error: could not parse duration \"" + snapshotCacheTtlStr + "\":" + err.Error())
 		}
 	}
+	if snapshotCacheMode == "" {
+		snapshotCacheMode = DEFAULT_SNAPSHOT_CACHE_MODE
+	} else if !IsValidSnapshotCacheMode(snapshotCacheMode) {
+		log.Fatal("Error: invalid snapshot cache mode \"" + snapshotCacheMode + "\" (expected \"query\" or \"all\")")
+	}
 	if maxConnections > 0 {
 		maxSessionsPerHost = maxConnections
 	}
@@ -150,7 +157,7 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeou
 	fmt.Println("Serving on", serverSockAddr)
 	fmt.Println("Using at most", maxSessionsPerHost, "connections per TrueNAS host with", maxCallsPerSession, "calls each")
 	if snapshotCacheTtl >= 0 {
-		fmt.Println("Sharing snapshot queries, caching them for", snapshotCacheTtl.String())
+		fmt.Println("Sharing snapshot queries (mode \""+snapshotCacheMode+"\"), caching them for", snapshotCacheTtl.String())
 	}
 	if daemonTimeout != 0 {
 		fmt.Println("With a daemon timeout of", daemonTimeout.String())
@@ -166,6 +173,7 @@ func RunDaemon(serverSockAddr string, globalTimeoutStr string, sessionIdleTimeou
 	}
 
 	daemon := newDaemonContext(daemonTimeout, sessionIdleTimeout, snapshotCacheTtl)
+	daemon.snapshotCacheMode = snapshotCacheMode
 
 	if sessionIdleTimeout > 0 {
 		go func() {
@@ -308,14 +316,24 @@ func (d *DaemonContext) serveImpl(r *http.Request) (json.RawMessage, error) {
 
 	if d.snapshotCache != nil {
 		if filters, cacheKey, ok := snapshotQueryCacheKey(method, params); ok {
-			all, err := d.snapshotCache.get(sessionKey+"\n"+cacheKey, func() (json.RawMessage, error) {
-				fetchAll := CallInfo{method: method, params: []interface{}{[]interface{}{}, params[1]}}
-				return d.callWithRetries(sessionKey, timeoutStr, fetchAll, login)
+			if d.snapshotCacheMode == SNAPSHOT_CACHE_MODE_ALL {
+				all, err := d.snapshotCache.get(sessionKey+"\n"+cacheKey, func() (json.RawMessage, error) {
+					fetchAll := CallInfo{method: method, params: []interface{}{[]interface{}{}, params[1]}}
+					return d.callWithRetries(sessionKey, timeoutStr, fetchAll, login)
+				})
+				if err != nil {
+					return nil, err
+				}
+				return makeResultResponse(filterSnapshots(all, filters))
+			}
+			filtersKey, _ := json.Marshal(filters)
+			snapshots, err := d.snapshotCache.get(sessionKey+"\n"+cacheKey+"\n"+string(filtersKey), func() (json.RawMessage, error) {
+				return d.callWithRetries(sessionKey, timeoutStr, call, login)
 			})
 			if err != nil {
 				return nil, err
 			}
-			return makeResultResponse(filterSnapshots(all, filters))
+			return makeResultResponse(snapshots)
 		}
 		if !isReadOnlyMethod(method) {
 			// before and after: jobs started by the call may finish later (see tnc_daemon.await_job)

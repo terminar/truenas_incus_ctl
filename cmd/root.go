@@ -34,6 +34,7 @@ var g_apiKey string
 var g_daemonMaxConnections int
 var g_daemonMaxCalls int
 var g_daemonSnapshotCacheTtl string
+var g_daemonSnapshotCacheMode string
 
 func Execute() {
 	err := rootCmd.Execute()
@@ -56,6 +57,7 @@ func init() {
 	daemonCmd.Flags().Int("max-connections", core.DEFAULT_MAX_SESSIONS_PER_HOST, "Maximum number of connections (and logins) per TrueNAS host")
 	daemonCmd.Flags().Int("max-calls", core.DEFAULT_MAX_CALLS_PER_SESSION, "Maximum number of parallel calls per connection; further calls wait for a free slot")
 	daemonCmd.Flags().String("snapshot-cache-ttl", "", "Fetch all snapshots once for concurrent zfs.snapshot.query calls and keep them for this duration (default 5s, 0 only shares running fetches, negative disables)")
+	daemonCmd.Flags().String("snapshot-cache-mode", "", "How snapshot queries are shared: \"query\" (default) sends identical queries once, \"all\" fetches all snapshots once and filters in the daemon (for a middleware without the snapshot-query-scope patch)")
 
 	rootCmd.AddCommand(daemonCmd)
 }
@@ -83,11 +85,12 @@ func runDaemon(cmd *cobra.Command, args []string) {
 	maxConnections, _ := cmd.Flags().GetInt("max-connections")
 	maxCalls, _ := cmd.Flags().GetInt("max-calls")
 	snapshotCacheTtlStr, _ := cmd.Flags().GetString("snapshot-cache-ttl")
+	snapshotCacheMode, _ := cmd.Flags().GetString("snapshot-cache-mode")
 	serverSockAddr := args[0]
 	if serverSockAddr == "" {
 		log.Fatal("Error: path to server socket was not provided")
 	}
-	core.RunDaemon(serverSockAddr, globalTimeoutStr, sessionIdleTimeoutStr, maxConnections, maxCalls, snapshotCacheTtlStr)
+	core.RunDaemon(serverSockAddr, globalTimeoutStr, sessionIdleTimeoutStr, maxConnections, maxCalls, snapshotCacheTtlStr, snapshotCacheMode)
 }
 
 func InitializeApiClient() core.Session {
@@ -126,9 +129,10 @@ func InitializeApiClient() core.Session {
 			IsDebug:       g_debug,
 			AllowInsecure: g_allowInsecure,
 
-			DaemonMaxConnections:   g_daemonMaxConnections,
-			DaemonMaxCalls:         g_daemonMaxCalls,
-			DaemonSnapshotCacheTtl: g_daemonSnapshotCacheTtl,
+			DaemonMaxConnections:    g_daemonMaxConnections,
+			DaemonMaxCalls:          g_daemonMaxCalls,
+			DaemonSnapshotCacheTtl:  g_daemonSnapshotCacheTtl,
+			DaemonSnapshotCacheMode: g_daemonSnapshotCacheMode,
 		}
 	} else {
 		api = &core.RealSession{
@@ -143,15 +147,16 @@ func InitializeApiClient() core.Session {
 }
 
 type daemonSettings struct {
-	maxConnections   int
-	maxCalls         int
-	snapshotCacheTtl string
+	maxConnections    int
+	maxCalls          int
+	snapshotCacheTtl  string
+	snapshotCacheMode string
 }
 
 // The daemon is shared by all hosts, so its settings live in an optional top-level "daemon"
 // section of the config file. It's read even when --host and --api-key are given (as Incus does):
 //
-//	"daemon": {"max_connections": 2, "max_calls": 4, "snapshot_cache_ttl": "5s"}
+//	"daemon": {"max_connections": 2, "max_calls": 4, "snapshot_cache_ttl": "5s", "snapshot_cache_mode": "query"}
 //
 // The settings are passed to the daemon when it gets launched; a daemon that is already
 // running keeps its settings until it exits. Invalid values are reported and ignored.
@@ -202,6 +207,13 @@ func loadDaemonSettings(fileName string) daemonSettings {
 			warnDaemonSetting(fileName, "daemon.snapshot_cache_ttl", "a duration like \"5s\"")
 		}
 	}
+	if value, exists := daemonMap["snapshot_cache_mode"]; exists {
+		if str, _ := value.(string); core.IsValidSnapshotCacheMode(str) {
+			settings.snapshotCacheMode = str
+		} else {
+			warnDaemonSetting(fileName, "daemon.snapshot_cache_mode", "\"query\" or \"all\"")
+		}
+	}
 	return settings
 }
 
@@ -213,6 +225,7 @@ func applyDaemonSettings(settings daemonSettings) {
 	g_daemonMaxConnections = settings.maxConnections
 	g_daemonMaxCalls = settings.maxCalls
 	g_daemonSnapshotCacheTtl = settings.snapshotCacheTtl
+	g_daemonSnapshotCacheMode = settings.snapshotCacheMode
 }
 
 // This method is called assuming that we're missing either a hostname or api key.

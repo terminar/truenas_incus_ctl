@@ -8,14 +8,27 @@ import (
 	"time"
 )
 
-// The TrueNAS 25.10 middleware answers every zfs.snapshot.query that isn't a plain id/name lookup
-// by reading *all* snapshots with their properties and filtering afterwards (~1s per query with
-// ~2400 snapshots, ~1.5s for all of them). The daemon therefore fetches all snapshots once,
-// shares the result between concurrent requests and keeps it for a short time, filtering
-// per request itself. Any call that might change state empties the cache.
+// The daemon shares zfs.snapshot.query calls between concurrent requests and keeps the result for
+// a short time. Any call that might change state empties the cache. Two modes:
+//
+//   - "query" (default): identical queries (same filters and options) are sent once. Meant for a
+//     middleware with patches/middlewared-25.10-snapshot-query-scope.patch, which only reads the
+//     snapshots of the filtered datasets (~0.01s for one dataset instead of ~1s).
+//   - "all": an unpatched TrueNAS 25.10 middleware answers every zfs.snapshot.query that isn't a
+//     plain id/name lookup by reading *all* snapshots with their properties and filtering
+//     afterwards (~1s per query with ~2400 snapshots). In this mode the daemon fetches all
+//     snapshots once and filters per request itself.
 
 const SNAPSHOT_QUERY_METHOD = "zfs.snapshot.query"
 const DEFAULT_SNAPSHOT_CACHE_TTL = 5 * time.Second
+
+const SNAPSHOT_CACHE_MODE_QUERY = "query"
+const SNAPSHOT_CACHE_MODE_ALL = "all"
+const DEFAULT_SNAPSHOT_CACHE_MODE = SNAPSHOT_CACHE_MODE_QUERY
+
+func IsValidSnapshotCacheMode(mode string) bool {
+	return mode == SNAPSHOT_CACHE_MODE_QUERY || mode == SNAPSHOT_CACHE_MODE_ALL
+}
 
 type snapshotCache struct {
 	mtx        sync.Mutex
@@ -46,8 +59,8 @@ func (c *snapshotCache) invalidate() {
 	c.entries = make(map[string]*snapshotCacheEntry)
 }
 
-// get returns all snapshots for cacheKey, either cached, from a fetch already running, or by
-// calling fetch. fetch receives no filter and must return the raw JSON-RPC response.
+// get returns the snapshots for cacheKey, either cached, from a fetch already running, or by
+// calling fetch, which must return the raw JSON-RPC response.
 func (c *snapshotCache) get(cacheKey string, fetch func() (json.RawMessage, error)) ([]map[string]interface{}, error) {
 	c.mtx.Lock()
 	e := c.entries[cacheKey]
